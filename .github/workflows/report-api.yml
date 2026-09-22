@@ -1,0 +1,157 @@
+# .github/workflows/report-api.yml
+# CI/CD pipeline for the MediReport.tn report generator API (FastAPI)
+#
+# Stages:  lint -> unit tests -> integration tests (real Redis) -> build image
+#          -> Trivy scan -> smoke test -> push to ghcr.io (main only)
+#          -> deploy staging (auto) -> deploy production (manual approval)
+#
+# Principle: build once, promote the SAME image (tagged by commit SHA) through
+# staging and production. Never rebuild per environment, never deploy :latest.
+#
+# Assumed repo layout (adjust paths if yours differ):
+#   services/report-api/
+#     app/                 FastAPI app (app.main:app)
+#     prompts/             versioned format templates (fr_narrative, soap_en)
+#     tests/unit/          pytest, LLM + Redis mocked (fakeredis)
+#     tests/integration/   pytest, real Redis, mocked LLM
+#     requirements.txt
+#     requirements-dev.txt (pytest, pytest-cov, fakeredis, ruff, mypy, httpx)
+#     Dockerfile           multi-stage, python:3.13-slim, non-root USER
+#
+# Required secrets:  RENDER_DEPLOY_HOOK_STAGING, RENDER_DEPLOY_HOOK_PROD
+#                    (or swap the deploy steps for Railway / SSH to your VM)
+# Required GitHub environments: "staging", "production" (add required reviewers
+#                    on "production" to get the manual approval gate)
+
+name: report-api
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/report-api/**"
+      - ".github/workflows/report-api.yml"
+  pull_request:
+    paths:
+      - "services/report-api/**"
+      - ".github/workflows/report-api.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: report-api-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  SERVICE_DIR: services/report-api
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/medireport-report-api
+
+defaults:
+  run:
+    working-directory: services/report-api
+
+jobs:
+  # ---------------------------------------------------------------- 1. Lint
+  lint:
+    name: Lint & type-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.SERVICE_DIR }}/requirements*.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check . --output-format=github
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Mypy
+        run: mypy app
+
+  # ---------------------------------------------------------- 2. Unit tests
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    needs: lint
+    env:
+      LLM_BACKEND: mock          # never call a real LLM in CI
+      REPORT_FORMATS: fr_narrative,soap_en
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.SERVICE_DIR }}/requirements*.txt
+
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest tests/unit \
+            --cov=app --cov-report=xml --cov-report=term-missing \
+            --cov-fail-under=80 \
+            --junitxml=junit-unit.xml
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-api-unit-results
+          path: |
+            ${{ env.SERVICE_DIR }}/junit-unit.xml
+            ${{ env.SERVICE_DIR }}/coverage.xml
+
+  # --------------------------------------------------- 3. Integration tests
+  integration-tests:
+    name: Integration tests (real Redis)
+    runs-on: ubuntu-24.04
+    needs: lint
+    services:
+      redis:
+        image: redis:8.2-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379/0
+      LLM_BACKEND: mock
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.SERVICE_DIR }}/requirements*.txt
+
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # Covers: job enqueued -> worker generates report -> result stored,
+      # plus failure paths (LLM timeout, job failure, Redis unreachable)
+      - name: Run integration tests
+        run: pytest tests/integration -v --junitxml=junit-integration.xml
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-api-integration-results
+          path: ${{ env.SERVICE_DIR }}/junit-integration.xml
+
+  
