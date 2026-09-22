@@ -9,16 +9,22 @@ jobs:
       run:
         working-directory: services/report-api
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - run: pip install -r requirements.txt
-      - run: pytest -v
+          python-version: "3.13"   
+      - name: Install development dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run tests
+        run: pytest -v
 
   build:
     runs-on: ubuntu-24.04
     needs: test
     steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t report-api:${{ github.sha }} services/report-api
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t report-api:${{ github.sha }} services/report-api
